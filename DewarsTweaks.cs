@@ -2,6 +2,7 @@ using System.Reflection;
 using SPTarkov.DI.Annotations;
 using SPTarkov.Server.Core.DI;
 using SPTarkov.Server.Core.Helpers;
+using SPTarkov.Server.Core.Models.Common;
 using SPTarkov.Server.Core.Models.Enums;
 using SPTarkov.Server.Core.Models.Spt.Config;
 using SPTarkov.Server.Core.Models.Spt.Mod;
@@ -17,7 +18,7 @@ public record ModMetadata : AbstractModMetadata
     public override string Name { get; init; } = "Dewar's Tweaks";
     public override string Author { get; init; } = "Dewar";
     public override List<string>? Contributors { get; init; }
-    public override SemanticVersioning.Version Version { get; init; } = new("1.3.0");
+    public override SemanticVersioning.Version Version { get; init; } = new("1.4.0");
     public override SemanticVersioning.Range SptVersion { get; init; } = new("~4.0.0");
     public override List<string>? Incompatibilities { get; init; }
     public override Dictionary<string, SemanticVersioning.Range>? ModDependencies { get; init; }
@@ -30,6 +31,7 @@ public record ModMetadata : AbstractModMetadata
 public class DewarsTweaks(
     ISptLogger<DewarsTweaks> logger,
     ModHelper modHelper,
+    DatabaseService databaseService,
     ConfigServer configServer,
     FluentTraderAssortCreator fluentAssortCreator)
     : IOnLoad
@@ -37,26 +39,22 @@ public class DewarsTweaks(
     private const string RefTraderId = "6617beeaa9cfa777ca915b7c";
     private const string GpCoinTpl = "5d235b4d86f7742e017bc88a";
 
-    // "Key" category (parent of KeyMechanical + Keycard) — the only category Fence keeps.
-    private const string KeyCategory = "543be5e94bdc2df1348b4568";
-    private const string KeyMechanicalParent = "5c99f98d86f7745c314214b3";
-    private const string KeycardParent = "5c164d2286f774194c5e69fa";
-
-    // All other top-level item categories (direct children of the root "Item" node).
-    // Fence's base-assort generator iterates the whole item DB and appends every valid
-    // item; blacklisting these leaves only "Key" items (mechanical keys + keycards).
-    // CompoundItem covers weapons/mods/gear/armor; StackableItem covers ammo/money.
-    private static readonly string[] NonKeyCategories =
+    // Root "Item" node + its 12 direct children (top-level categories). Fence's base-assort
+    // generator iterates the whole item DB and keeps anything not blacklisted, so we compute
+    // the minimal blacklist (everything not under a wanted category) from this tree.
+    private const string RootItemNode = "54009119af1c881c07000029";
+    private static readonly string[] TopLevelCategories =
     [
         "543be5664bdc2dd4348b4569", // Meds
+        "543be5e94bdc2df1348b4568", // Key
         "543be6564bdc2df4348b4568", // ThrowWeap
         "543be6674bdc2df1348b4569", // FoodDrink
         "5447e0e74bdc2d3c308b4567", // SpecItem
         "5447e1d04bdc2dff2f8b4567", // Knife
         "5448eb774bdc2d0a728b4567", // BarterItem
         "5448ecbe4bdc2d60728b4568", // Info
-        "566162e44bdc2d3f298b4573", // CompoundItem
-        "5661632d4bdc2d903d8b456b", // StackableItem
+        "566162e44bdc2d3f298b4573", // CompoundItem (weapons/mods/gear/armor)
+        "5661632d4bdc2d903d8b456b", // StackableItem (ammo/money)
         "567849dd4bdc2d150f8b456e", // Map
         "6759673c76e93d8eb20b2080", // Flyer
     ];
@@ -69,8 +67,8 @@ public class DewarsTweaks(
         if (config.AddGpCoinsToRef)
             AddGpCoinsToRef();
 
-        if (config.ReplaceFenceWithKeys)
-            MakeFenceKeysOnly(config);
+        if (config.ReplaceFenceCategories)
+            ApplyFenceCategoryFilter(config);
 
         return Task.CompletedTask;
     }
@@ -88,46 +86,106 @@ public class DewarsTweaks(
     }
 
     /// <summary>
-    /// Turn Fence into a keys-only shop. Fence's base-assort generator walks the entire
-    /// item DB and appends every valid item (+ presets), so the clean approach is to
-    /// blacklist every top-level category EXCEPT "Key". We also drop the key price caps /
-    /// type limits that would otherwise hide most keys, and zero the weapon/equipment
-    /// preset counts. Fence then generates the full key list itself (its own pricing).
+    /// Turn Fence into a curated shop driven by a category-&gt;count map. Only the configured
+    /// categories are sold (every other category is blacklisted so Fence's generator skips
+    /// it), each category capped to its configured count, presets disabled, and AssortSize
+    /// set to the sum of counts (clamped to keep offer generation from hanging).
     /// </summary>
-    private void MakeFenceKeysOnly(ModConfig config)
+    private void ApplyFenceCategoryFilter(ModConfig config)
     {
         var fence = configServer.GetConfig<TraderConfig>()?.Fence;
         if (fence == null)
         {
-            logger.Warning("[Dewar's Tweaks] Fence config not found; skipping keys-only setup.");
+            logger.Warning("[Dewar's Tweaks] Fence config not found; skipping category filter.");
             return;
         }
 
-        // Whitelist keys by blacklisting everything else.
+        var counts = config.FenceCategoryCounts;
+        if (counts == null || counts.Count == 0)
+        {
+            logger.Warning("[Dewar's Tweaks] fenceCategoryCounts is empty; skipping category filter.");
+            return;
+        }
+
+        var items = databaseService.GetItems();
+
+        // Category-node tree (skip leaf items): parent -> direct child category ids.
+        var childrenOf = new Dictionary<string, List<string>>();
+        foreach (var (id, tpl) in items)
+        {
+            if (string.Equals(tpl.Type, "Item", StringComparison.OrdinalIgnoreCase)) continue;
+            var parent = tpl.Parent.ToString();
+            (childrenOf.TryGetValue(parent, out var list) ? list : childrenOf[parent] = []).Add(id.ToString());
+        }
+
+        bool IsUnder(string descId, string ancId)
+        {
+            var cur = descId;
+            for (var i = 0; i < 32 && cur != null; i++)
+            {
+                if (cur == ancId) return true;
+                if (!items.TryGetValue(new MongoId(cur), out var n)) break;
+                cur = n.Parent.ToString();
+            }
+            return false;
+        }
+
+        var wanted = counts.Keys.ToHashSet();
+
+        // Minimal blacklist: blacklist any subtree that contains no wanted category; recurse
+        // into partially-wanted subtrees so siblings of wanted sub-categories are excluded.
+        var blacklist = new List<string>();
+        void Exclude(string cat)
+        {
+            if (wanted.Contains(cat)) return;                                  // keep whole subtree
+            if (!wanted.Any(w => IsUnder(w, cat))) { blacklist.Add(cat); return; } // nothing wanted inside
+            if (childrenOf.TryGetValue(cat, out var kids))                     // partial -> recurse
+                foreach (var c in kids) Exclude(c);
+        }
+        foreach (var top in TopLevelCategories) Exclude(top);
+
         fence.Blacklist ??= [];
-        foreach (var cat in NonKeyCategories)
-            if (!fence.Blacklist.Contains(cat))
-                fence.Blacklist.Add(cat);
-        // Ensure keys are never blacklisted.
-        fence.Blacklist.Remove(KeyCategory);
-        fence.Blacklist.Remove(KeyMechanicalParent);
-        fence.Blacklist.Remove(KeycardParent);
+        foreach (var b in blacklist)
+            if (!fence.Blacklist.Contains(b)) fence.Blacklist.Add(b);
 
-        // Drop the per-category caps/limits that hide keys.
-        fence.ItemCategoryRoublePriceLimit?.Remove(KeyMechanicalParent);
-        fence.ItemCategoryRoublePriceLimit?.Remove(KeycardParent);
-        fence.ItemTypeLimits?.Remove(KeyMechanicalParent);
-        fence.ItemTypeLimits?.Remove(KeycardParent);
+        // Clear the blacklist path from each wanted category up to root (undo any vanilla
+        // category blacklist that would otherwise block a wanted category).
+        foreach (var w in wanted)
+        {
+            var cur = w;
+            for (var i = 0; i < 32 && cur != null; i++)
+            {
+                fence.Blacklist.Remove(cur);
+                if (cur == RootItemNode || !items.TryGetValue(new MongoId(cur), out var n)) break;
+                cur = n.Parent.ToString();
+            }
+        }
 
-        // No weapon/equipment presets so Fence only surfaces keys.
+        // Per-category counts.
+        fence.ItemTypeLimits ??= [];
+        foreach (var (cat, count) in counts)
+            fence.ItemTypeLimits[new MongoId(cat)] = count;
+
+        // Curated shop: drop price caps and presets. Both the normal and the rep-6+ discount
+        // assort generate presets, so zero both (weapons are blacklisted = empty preset pool).
+        fence.ItemCategoryRoublePriceLimit?.Clear();
         if (fence.WeaponPresetMinMax != null) { fence.WeaponPresetMinMax.Min = 0; fence.WeaponPresetMinMax.Max = 0; }
         if (fence.EquipmentPresetMinMax != null) { fence.EquipmentPresetMinMax.Min = 0; fence.EquipmentPresetMinMax.Max = 0; }
-        // Show N keys per cycle (rotates through the key pool on each Fence refresh). MUST
-        // stay below the pool size: Fence picks AssortSize UNIQUE items, and exceeding the
-        // pool makes it loop forever during flea-offer generation (server hangs). Clamp to
-        // a safe ceiling so a bad config value can't hang the server.
-        fence.AssortSize = Math.Clamp(config.FenceKeyAssortSize, 1, 200);
+        if (fence.DiscountOptions?.WeaponPresetMinMax != null) { fence.DiscountOptions.WeaponPresetMinMax.Min = 0; fence.DiscountOptions.WeaponPresetMinMax.Max = 0; }
+        if (fence.DiscountOptions?.EquipmentPresetMinMax != null) { fence.DiscountOptions.EquipmentPresetMinMax.Min = 0; fence.DiscountOptions.EquipmentPresetMinMax.Max = 0; }
 
-        logger.Success($"[Dewar's Tweaks] Fence is now keys-only (mechanical keys + keycards), {fence.AssortSize} per cycle.");
+        // Total offers = sum of counts. Clamp so a huge config can't hang offer generation.
+        var total = counts.Values.Where(v => v > 0).Sum();
+        fence.AssortSize = Math.Clamp(total, 1, 250);
+        if (fence.DiscountOptions != null) fence.DiscountOptions.AssortSize = fence.AssortSize;
+
+        // Freeze the assort after generation so DewarsFencePricing's flea-price + durability
+        // edits persist (no on-refresh regen, no periodic partial refresh during a session).
+        fence.RegenerateAssortsOnRefresh = false;
+        fence.PartialRefreshTimeSeconds = 2_000_000_000;
+
+        logger.Success(
+            $"[Dewar's Tweaks] Fence category filter: {counts.Count} categories, " +
+            $"{fence.AssortSize} offers/cycle, {blacklist.Count} subtrees blacklisted.");
     }
 }

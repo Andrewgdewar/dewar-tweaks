@@ -1,5 +1,17 @@
 {
   "addGpCoinsToRef": true,
-  "replaceFenceWithKeys": true,
-  "fenceKeyAssortSize": 100
+  "replaceFenceCategories": true,
+  "fenceCategoryCounts": {
+    "5c99f98d86f7745c314214b3": 65,
+    "5c164d2286f774194c5e69fa": 3,
+    "543be5664bdc2dd4348b4569": 5,
+    "543be6674bdc2df1348b4569": 5
+  },
+  "fencePriceMultiplier": 2.0,
+  "fenceCategoryPriceMultipliers": {
+    "543be5664bdc2dd4348b4569": 1,
+    "543be6674bdc2df1348b4569": 1
+  },
+  "fenceDurabilityMinPercent": 10,
+  "fenceDurabilityMaxPercent": 70
 }
