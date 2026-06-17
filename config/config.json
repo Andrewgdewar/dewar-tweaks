@@ -5,13 +5,15 @@
     "5c99f98d86f7745c314214b3": 65,
     "5c164d2286f774194c5e69fa": 3,
     "543be5664bdc2dd4348b4569": 5,
-    "543be6674bdc2df1348b4569": 5
+    "543be6674bdc2df1348b4569": 5,
+    "5448eb774bdc2d0a728b4567": 5
   },
   "fencePriceMultiplier": 2.0,
   "fenceCategoryPriceMultipliers": {
-    "543be5664bdc2dd4348b4569": 1,
-    "543be6674bdc2df1348b4569": 1
+    "543be5664bdc2dd4348b4569": 1.5,
+    "543be6674bdc2df1348b4569": 1.2,
+    "5448eb774bdc2d0a728b4567": 1.5
   },
-  "fenceDurabilityMinPercent": 10,
+  "fenceDurabilityMinPercent": 25,
   "fenceDurabilityMaxPercent": 70
 }
