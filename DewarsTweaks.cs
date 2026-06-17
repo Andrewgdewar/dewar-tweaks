@@ -161,8 +161,8 @@ public class DewarsTweaks(
             }
         }
 
-        // Per-category counts.
-        fence.ItemTypeLimits ??= [];
+        // Per-category counts — clear existing limits, set ONLY our categories.
+        fence.ItemTypeLimits = [];
         foreach (var (cat, count) in counts)
             fence.ItemTypeLimits[new MongoId(cat)] = count;
 
